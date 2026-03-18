@@ -1,18 +1,9 @@
 // Package proxy implements the caching HTTP reverse proxy for PyPI.
 //
-// How the two-stage PyPI download works:
-//
-//  1. pip requests the index:  GET /simple/requests/
-//     → proxy fetches from pypi.org (plain text, no gzip), rewrites all
-//       download links to point back through itself, returns modified HTML.
-//       NOT cached — always fresh.
-//
-//  2. pip follows a rewritten link: GET /packages/.../requests-2.32.3.tar.gz
-//     → proxy fetches from files.pythonhosted.org, caches the file, streams
-//       to pip. On subsequent requests: served from cache instantly.
-//
-// This means ONLY immutable package files are cached. Index pages are always
-// fresh from PyPI (they change when new versions are published).
+// Resolution order for package files:
+//   1. Local disk cache (instant, 0ms)
+//   2. LAN peer swarm (fast, ~5ms over LAN)
+//   3. Upstream registry (slow, 50-500ms over internet)
 package proxy
 
 import (
@@ -27,28 +18,28 @@ import (
 
 	"p2p-ci/internal/config"
 	"p2p-ci/internal/store"
+	"p2p-ci/internal/swarm"
 )
 
-// filesHost is where PyPI actually serves package files from.
 const filesHost = "https://files.pythonhosted.org"
 
-// linkRewriter matches href="https://files.pythonhosted.org/packages/..."
-// and rewrites to href="/packages/..." so pip fetches through our proxy.
 var linkRewriter = regexp.MustCompile(`href="https://files\.pythonhosted\.org(/packages/[^"]+)"`)
 
 type Handler struct {
 	cfg       *config.Config
 	store     *store.Store
+	swarm     *swarm.Swarm
 	upstream  *http.Client
 	log       *slog.Logger
 	indexBase *url.URL
 }
 
-func New(cfg *config.Config, st *store.Store, log *slog.Logger) *Handler {
+func New(cfg *config.Config, st *store.Store, sw *swarm.Swarm, log *slog.Logger) *Handler {
 	base, _ := url.Parse(cfg.UpstreamRegistry)
 	return &Handler{
 		cfg:       cfg,
 		store:     st,
+		swarm:     sw,
 		log:       log,
 		indexBase: base,
 		upstream: &http.Client{
@@ -81,13 +72,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// serveIndex fetches a fresh index page from PyPI and rewrites all download
-// links so they point through this proxy instead of files.pythonhosted.org.
-//
-// KEY: We do NOT forward Accept-Encoding here. This forces PyPI to return
-// plain uncompressed HTML so our regex can match and rewrite the links.
-// If we forwarded gzip, we'd be regex-matching compressed bytes — no match,
-// no rewriting, pip goes straight to files.pythonhosted.org, cache never fills.
 func (h *Handler) serveIndex(w http.ResponseWriter, r *http.Request) {
 	upstreamURL := h.indexBase.String() + r.URL.Path
 	if r.URL.RawQuery != "" {
@@ -96,7 +80,6 @@ func (h *Handler) serveIndex(w http.ResponseWriter, r *http.Request) {
 
 	h.log.Info("index (not cached)", "path", r.URL.Path)
 
-	// Build request — explicitly NO Accept-Encoding so we get plain text back.
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, upstreamURL, nil)
 	if err != nil {
 		http.Error(w, "build request failed", http.StatusInternalServerError)
@@ -104,7 +87,7 @@ func (h *Handler) serveIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Header.Set("Accept", "text/html")
 	req.Header.Set("User-Agent", r.Header.Get("User-Agent"))
-	// Intentionally omitting Accept-Encoding → PyPI sends uncompressed HTML
+	// No Accept-Encoding — forces plain text so regex rewriting works.
 
 	resp, err := h.upstream.Do(req)
 	if err != nil {
@@ -120,12 +103,6 @@ func (h *Handler) serveIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Rewrite:
-	//   href="https://files.pythonhosted.org/packages/...whl#sha256=abc"
-	// →  href="/packages/...whl#sha256=abc"
-	//
-	// pip follows the rewritten /packages/... URL back to our proxy,
-	// which serves from cache or fetches + caches from files.pythonhosted.org.
 	rewritten := linkRewriter.ReplaceAll(body, []byte(`href="$1"`))
 
 	h.log.Info("index rewritten",
@@ -135,7 +112,6 @@ func (h *Handler) serveIndex(w http.ResponseWriter, r *http.Request) {
 	)
 
 	copyHeaders(w.Header(), resp.Header)
-	// Remove Content-Encoding since we served uncompressed content.
 	w.Header().Del("Content-Encoding")
 	w.Header().Set("X-P2PCI-Cache", "BYPASS")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(rewritten)))
@@ -143,30 +119,27 @@ func (h *Handler) serveIndex(w http.ResponseWriter, r *http.Request) {
 	w.Write(rewritten) //nolint:errcheck
 }
 
-// servePackageFile serves a .whl / .tar.gz from cache, or fetches from
-// files.pythonhosted.org, caches it, and streams to the client.
 func (h *Handler) servePackageFile(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	path := r.URL.Path
 	upstreamURL := filesHost + path
 	cacheKey := upstreamURL
 
-	// --- Cache hit ---
+	// ── 1. Local cache ───────────────────────────────────────────────────
 	reader, entry, err := h.store.Get(cacheKey)
 	if err != nil {
-		h.log.Warn("cache read error, falling back to upstream", "err", err)
+		h.log.Warn("cache read error, continuing", "err", err)
 	}
 	if reader != nil {
 		defer reader.Close()
-		h.log.Info("cache HIT",
+		h.log.Info("cache HIT (local)",
 			"file", fileBaseName(path),
 			"size_kb", entry.Size/1024,
 			"elapsed_ms", time.Since(start).Milliseconds(),
 		)
-		if entry.ContentType != "" {
-			w.Header().Set("Content-Type", entry.ContentType)
-		}
+		w.Header().Set("Content-Type", entry.ContentType)
 		w.Header().Set("X-P2PCI-Cache", "HIT")
+		w.Header().Set("X-P2PCI-Source", "local")
 		w.Header().Set("X-P2PCI-Hash", entry.Hash[:12])
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", entry.Size))
 		if r.Method == http.MethodHead {
@@ -176,10 +149,53 @@ func (h *Handler) servePackageFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// --- Cache miss: fetch from files.pythonhosted.org ---
-	h.log.Info("cache MISS — fetching",
+	// ── 2. Peer swarm ────────────────────────────────────────────────────
+	if h.swarm != nil && h.swarm.PeerCount() > 0 {
+		peerReader, peerAddr, err := h.swarm.FetchFromPeers(cacheKey)
+		if err != nil {
+			h.log.Warn("swarm fetch error, falling back to upstream",
+				"file", fileBaseName(path), "err", err)
+		} else if peerReader != nil {
+			defer peerReader.Close()
+			h.log.Info("cache HIT (peer)",
+				"file", fileBaseName(path),
+				"peer", peerAddr,
+				"elapsed_ms", time.Since(start).Milliseconds(),
+			)
+
+			// Re-read from local store so we serve the hash-verified version.
+			if localReader, localEntry, e := h.store.Get(cacheKey); e == nil && localReader != nil {
+				defer localReader.Close()
+				w.Header().Set("Content-Type", localEntry.ContentType)
+				w.Header().Set("X-P2PCI-Cache", "HIT")
+				w.Header().Set("X-P2PCI-Source", fmt.Sprintf("peer:%s", peerAddr))
+				w.Header().Set("X-P2PCI-Hash", localEntry.Hash[:12])
+				w.Header().Set("Content-Length", fmt.Sprintf("%d", localEntry.Size))
+				if r.Method != http.MethodHead {
+					io.Copy(w, localReader) //nolint:errcheck
+				}
+				return
+			}
+
+			// Store write still in progress — stream from peer reader directly.
+			w.Header().Set("X-P2PCI-Cache", "HIT")
+			w.Header().Set("X-P2PCI-Source", fmt.Sprintf("peer:%s", peerAddr))
+			if r.Method != http.MethodHead {
+				io.Copy(w, peerReader) //nolint:errcheck
+			}
+			return
+		}
+	}
+
+	// ── 3. Upstream registry ─────────────────────────────────────────────
+	h.log.Info("cache MISS — fetching upstream",
 		"file", fileBaseName(path),
-		"from", filesHost,
+		"peers_checked", func() int {
+			if h.swarm != nil {
+				return h.swarm.PeerCount()
+			}
+			return 0
+		}(),
 	)
 
 	resp, err := h.fetchUpstream(r, upstreamURL)
@@ -203,8 +219,7 @@ func (h *Handler) servePackageFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Tee: stream to client AND write to cache simultaneously.
-	// Client gets bytes immediately — no added latency.
+	// Tee to client + cache simultaneously.
 	pr, pw := io.Pipe()
 	storeDone := make(chan error, 1)
 	go func() {
@@ -212,7 +227,7 @@ func (h *Handler) servePackageFile(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			h.log.Error("store.Put failed", "err", err)
 		} else {
-			h.log.Info("cached",
+			h.log.Info("cached from upstream",
 				"file", fileBaseName(path),
 				"hash", hash[:12],
 				"elapsed_ms", time.Since(start).Milliseconds(),
@@ -223,6 +238,7 @@ func (h *Handler) servePackageFile(w http.ResponseWriter, r *http.Request) {
 
 	copyHeaders(w.Header(), resp.Header)
 	w.Header().Set("X-P2PCI-Cache", "MISS")
+	w.Header().Set("X-P2PCI-Source", "upstream")
 	w.WriteHeader(http.StatusOK)
 
 	tee := io.TeeReader(resp.Body, pw)
@@ -235,7 +251,6 @@ func (h *Handler) servePackageFile(w http.ResponseWriter, r *http.Request) {
 	<-storeDone
 }
 
-// passThrough proxies without caching.
 func (h *Handler) passThrough(w http.ResponseWriter, r *http.Request, upstreamURL string) {
 	resp, err := h.fetchUpstream(r, upstreamURL)
 	if err != nil {

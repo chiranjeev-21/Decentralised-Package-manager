@@ -1,24 +1,7 @@
-# p2p-ci proxy configuration
-
-listen_addr: "127.0.0.1:7878"
-cache_dir: "~/.p2p-cache"
+listen_addr: "127.0.0.1:7878"    # pip points here (localhost only)
+peer_addr:   "0.0.0.0:7879"      # LAN peers connect here (all interfaces)
+cache_dir:   "~/.p2p-cache"
 max_cache_size_gb: 20
-
-# The real registry this proxy forwards to.
-# Run a separate proxy instance per registry if needed,
-# or change this and restart to switch registries.
-#
-# PyPI:
 upstream_registry: "https://pypi.org"
-#
-# npm:
-# upstream_registry: "https://registry.npmjs.org"
-#
-# crates.io:
-# upstream_registry: "https://static.crates.io"
-
-# Optional audit log path
 audit_log: ""
-
-# Optional org secret for opaque bundle IDs (Phase 3)
 org_secret: ""
