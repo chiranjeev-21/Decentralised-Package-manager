@@ -39,7 +39,7 @@ type Server struct {
 	connCount map[string]int
 }
 
-const maxConnsPerPeer = 4
+const maxConnsPerPeer = 16
 
 // NewServer creates a peer server that will listen on addr (e.g. ":7879").
 func NewServer(addr string, st *store.Store, log *slog.Logger) *Server {
@@ -167,7 +167,7 @@ func (s *Server) trackConn(c net.Conn, state http.ConnState) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch state {
-	case http.StateNew, http.StateActive:
+	case http.StateNew:
 		s.connCount[ip]++
 	case http.StateClosed, http.StateHijacked:
 		s.connCount[ip]--
