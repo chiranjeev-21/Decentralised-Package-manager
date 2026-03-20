@@ -105,3 +105,6 @@ Add the libp2p node and mDNS peer discovery. CI machines in the same datacenter 
 
 **Phase 3 — Cross-datacenter DHT (weeks 5–6)**
 Add the DHT bootstrap node. Builds in different regions and datacenters find each other's bundles.
+
+
+So far, Phase 1 and 2 have been implemented
